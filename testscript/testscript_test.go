@@ -223,15 +223,6 @@ func TestScripts(t *testing.T) {
 				fset := flag.NewFlagSet("testscript", flag.ContinueOnError)
 				fUpdate := fset.Bool("update", false, "update scripts when cmp fails")
 				fExplicitExec := fset.Bool("explicit-exec", false, "require explicit use of exec for commands")
-				fUniqueNames := fset.Bool("unique-names", false, "require unique names in txtar archive")
-				fVerbose := fset.Bool("v", false, "be verbose with output")
-				fContinue := fset.Bool("continue", false, "continue on error")
-				fFiles := fset.Bool("files", false, "specify files rather than a directory")
-				if err := fset.Parse(args); err != nil {
-					ts.Fatalf("failed to parse args for testscript: %v", err)
-				}
-				if fset.NArg() != 1 && !*fFiles {
-					ts.Fatalf("testscript [-v] [-continue] [-update] [-explicit-exec] [-files] <dir>|<file>...")
 				}
 				var files []string
 				var dir string

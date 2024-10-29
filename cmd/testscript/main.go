@@ -117,11 +117,6 @@ func mainerr() (retErr error) {
 	}
 
 	p := testscript.Params{
-		Setup:           func(*testscript.Env) error { return nil },
-		Files:           files,
-		UpdateScripts:   *fUpdate,
-		ContinueOnError: *fContinue,
-		TestWork:        *fWork,
 	}
 
 	if _, err := exec.LookPath("go"); err == nil {
@@ -157,11 +152,6 @@ func mainerr() (retErr error) {
 			if !ok {
 				v += "=" + os.Getenv(v)
 			}
-			switch varName {
-			case "":
-				return fmt.Errorf("invalid variable name %q", varName)
-			case "WORK":
-				return fmt.Errorf("cannot override WORK variable")
 			}
 			env.Vars = append(env.Vars, v)
 		}
@@ -188,9 +178,6 @@ var (
 
 // runT implements testscript.T and is used in the call to testscript.Run
 type runT struct {
-	verbose       bool
-	stdinTempFile string
-	failed        atomic.Bool
 }
 
 func (r *runT) Skip(is ...interface{}) {
@@ -207,14 +194,6 @@ func (r *runT) Parallel() {
 }
 
 func (r *runT) Log(is ...interface{}) {
-	msg := fmt.Sprint(is...)
-	if r.stdinTempFile != "" {
-		msg = strings.ReplaceAll(msg, r.stdinTempFile, "<stdin>")
-	}
-	if !strings.HasSuffix(msg, "\n") {
-		msg += "\n"
-	}
-	fmt.Print(msg)
 }
 
 func (r *runT) FailNow() {

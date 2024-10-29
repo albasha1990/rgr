@@ -187,19 +187,10 @@ type Params struct {
 	// executions explicit.
 	RequireExplicitExec bool
 
-	// RequireUniqueNames requires that names in the txtar archive are unique.
-	// By default, later entries silently overwrite earlier ones.
-	RequireUniqueNames bool
-
 	// ContinueOnError causes a testscript to try to continue in
 	// the face of errors. Once an error has occurred, the script
 	// will continue as if in verbose mode.
 	ContinueOnError bool
-
-	// Deadline, if not zero, specifies the time at which the test run will have
-	// exceeded the timeout. It is equivalent to testing.T's Deadline method,
-	// and Run will set it to the method's return value if this field is zero.
-	Deadline time.Time
 }
 
 // RunDir runs the tests in the given directory. All files in dir with a ".txt"
@@ -650,11 +641,6 @@ func (ts *TestScript) run() {
 	for _, bg := range ts.background {
 		interruptProcess(bg.cmd.Process)
 	}
-	// On some platforms like Windows, we kill background commands directly
-	// as we can't send them an interrupt signal, so they always fail.
-	// Moreover, it's relatively common for a process to fail when interrupted.
-	// Once we've reached the end of the script, ignore the status of background commands.
-	ts.waitBackground(false)
 
 	// If we reached here but we've failed (probably because ContinueOnError
 	// was set), don't wipe the log and print "PASS".
@@ -669,11 +655,6 @@ func (ts *TestScript) run() {
 		fmt.Fprintf(&ts.log, "PASS\n")
 	}
 }
-
-func (ts *TestScript) runLine(line string) (runOK bool) {
-	defer catchFailNow(func() {
-		runOK = false
-	})
 
 	// Parse input line. Ignore blanks entirely.
 	args := ts.parse(line)
@@ -717,75 +698,6 @@ func (ts *TestScript) runLine(line string) (runOK bool) {
 		if len(args) == 0 {
 			ts.Fatalf("! on line by itself")
 		}
-	}
-
-	// Run command.
-	cmd := scriptCmds[args[0]]
-	if cmd == nil {
-		cmd = ts.params.Cmds[args[0]]
-	}
-	if cmd == nil {
-		// try to find spelling corrections. We arbitrarily limit the number of
-		// corrections, to not be too noisy.
-		switch c := ts.cmdSuggestions(args[0]); len(c) {
-		case 1:
-			ts.Fatalf("unknown command %q (did you mean %q?)", args[0], c[0])
-		case 2, 3, 4:
-			ts.Fatalf("unknown command %q (did you mean one of %q?)", args[0], c)
-		default:
-			ts.Fatalf("unknown command %q", args[0])
-		}
-	}
-	ts.callBuiltinCmd(func() {
-		cmd(ts, neg, args[1:])
-	})
-	return true
-}
-
-func (ts *TestScript) callBuiltinCmd(runCmd func()) {
-	ts.runningBuiltin = true
-	defer func() {
-		r := recover()
-		ts.runningBuiltin = false
-		ts.clearBuiltinStd()
-		switch r {
-		case nil:
-			// we did not panic
-		default:
-			// re-"throw" the panic
-			panic(r)
-		}
-	}()
-	runCmd()
-}
-
-func (ts *TestScript) cmdSuggestions(name string) []string {
-	// special case: spell-correct `!cmd` to `! cmd`
-	if strings.HasPrefix(name, "!") {
-		if _, ok := scriptCmds[name[1:]]; ok {
-			return []string{"! " + name[1:]}
-		}
-		if _, ok := ts.params.Cmds[name[1:]]; ok {
-			return []string{"! " + name[1:]}
-		}
-	}
-	var candidates []string
-	for c := range scriptCmds {
-		if misspell.AlmostEqual(name, c) {
-			candidates = append(candidates, c)
-		}
-	}
-	for c := range ts.params.Cmds {
-		if misspell.AlmostEqual(name, c) {
-			candidates = append(candidates, c)
-		}
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-	// deduplicate candidates
-	slices.Sort(candidates)
-	return slices.Compact(candidates)
 }
 
 func (ts *TestScript) applyScriptUpdates() {
