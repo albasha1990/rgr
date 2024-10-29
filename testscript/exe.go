@@ -6,7 +6,6 @@ package testscript
 
 import (
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -56,7 +55,7 @@ func RunMain(m TestingM, commands map[string]func() int) (exitCode int) {
 		// test binary by "go test".
 
 		// Set up all commands in a directory, added in $PATH.
-		tmpdir, err := ioutil.TempDir("", "testscript-main")
+		tmpdir, err := os.MkdirTemp("", "testscript-main")
 		if err != nil {
 			log.Printf("could not set up temporary directory: %v", err)
 			return 2
@@ -76,7 +75,6 @@ func RunMain(m TestingM, commands map[string]func() int) (exitCode int) {
 
 		// We're not in a subcommand.
 		for name := range commands {
-			name := name
 			// Set up this command in the directory we added to $PATH.
 			binfile := filepath.Join(bindir, name)
 			if runtime.GOOS == "windows" {
@@ -117,15 +115,12 @@ func RunMain(m TestingM, commands map[string]func() int) (exitCode int) {
 // Second, symlinks might not be available on some environments, so we have to
 // implement a "full copy" fallback anyway.
 //
-// However, we do try to use a hard link, since that will probably work on most
+// However, we do try to use cloneFile, since that will probably work on most
 // unix-like setups. Note that "go test" also places test binaries in the
-// system's temporary directory, like we do. We don't use hard links on Windows,
-// as that can lead to "access denied" errors when removing.
+// system's temporary directory, like we do.
 func copyBinary(from, to string) error {
-	if runtime.GOOS != "windows" {
-		if err := os.Link(from, to); err == nil {
-			return nil
-		}
+	if err := cloneFile(from, to); err == nil {
+		return nil
 	}
 	writer, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE, 0o777)
 	if err != nil {
@@ -142,37 +137,3 @@ func copyBinary(from, to string) error {
 	_, err = io.Copy(writer, reader)
 	return err
 }
-
-type nopTestDeps struct{}
-
-func (nopTestDeps) MatchString(pat, str string) (result bool, err error) {
-	return false, nil
-}
-
-func (nopTestDeps) StartCPUProfile(w io.Writer) error {
-	return nil
-}
-
-func (nopTestDeps) StopCPUProfile() {}
-
-func (nopTestDeps) WriteProfileTo(name string, w io.Writer, debug int) error {
-	return nil
-}
-
-func (nopTestDeps) ImportPath() string {
-	return ""
-}
-func (nopTestDeps) StartTestLog(w io.Writer) {}
-
-func (nopTestDeps) StopTestLog() error {
-	return nil
-}
-
-// Note: WriteHeapProfile is needed for Go 1.10 but not Go 1.11.
-func (nopTestDeps) WriteHeapProfile(io.Writer) error {
-	// Not needed for Go 1.10.
-	return nil
-}
-
-// Note: SetPanicOnExit0 was added in Go 1.16.
-func (nopTestDeps) SetPanicOnExit0(bool) {}

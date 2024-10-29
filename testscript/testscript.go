@@ -14,13 +14,15 @@ import (
 	"flag"
 	"fmt"
 	"go/build"
+	"io"
 	"io/fs"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -28,9 +30,11 @@ import (
 	"time"
 
 	"github.com/rogpeppe/go-internal/imports"
+	"github.com/rogpeppe/go-internal/internal/misspell"
 	"github.com/rogpeppe/go-internal/internal/os/execpath"
 	"github.com/rogpeppe/go-internal/par"
 	"github.com/rogpeppe/go-internal/testenv"
+	"github.com/rogpeppe/go-internal/testscript/internal/pty"
 	"github.com/rogpeppe/go-internal/txtar"
 )
 
@@ -97,6 +101,13 @@ func (e *Env) Getenv(key string) string {
 	return ""
 }
 
+func envvarname(k string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(k)
+	}
+	return k
+}
+
 // Setenv sets the value of the environment variable named by the key. It
 // panics if key is invalid.
 func (e *Env) Setenv(key, value string) {
@@ -125,6 +136,11 @@ type Params struct {
 	// considered as test scripts. By default the current directory is used.
 	// Dir is interpreted relative to the current test directory.
 	Dir string
+
+	// Files holds a set of script filenames. If Dir is empty and this
+	// is non-nil, these files will be used instead of reading
+	// a directory.
+	Files []string
 
 	// Setup is called, if not nil, to complete any setup required
 	// for a test. The WorkDir and Vars fields will have already
@@ -171,19 +187,10 @@ type Params struct {
 	// executions explicit.
 	RequireExplicitExec bool
 
-	// RequireUniqueNames requires that names in the txtar archive are unique.
-	// By default, later entries silently overwrite earlier ones.
-	RequireUniqueNames bool
-
 	// ContinueOnError causes a testscript to try to continue in
 	// the face of errors. Once an error has occurred, the script
 	// will continue as if in verbose mode.
 	ContinueOnError bool
-
-	// Deadline, if not zero, specifies the time at which the test run will have
-	// exceeded the timeout. It is equivalent to testing.T's Deadline method,
-	// and Run will set it to the method's return value if this field is zero.
-	Deadline time.Time
 }
 
 // RunDir runs the tests in the given directory. All files in dir with a ".txt"
@@ -209,8 +216,7 @@ type T interface {
 	Verbose() bool
 }
 
-// TFailed holds optional extra methods implemented on T.
-// It's defined as a separate type for backward compatibility reasons.
+// Deprecated: this type is unused.
 type TFailed interface {
 	Failed() bool
 }
@@ -232,33 +238,38 @@ func (t tshim) Verbose() bool {
 // RunT is like Run but uses an interface type instead of the concrete *testing.T
 // type to make it possible to use testscript functionality outside of go test.
 func RunT(t T, p Params) {
-	entries, err := os.ReadDir(p.Dir)
-	if os.IsNotExist(err) {
-		// Continue so we give a helpful error on len(files)==0 below.
-	} else if err != nil {
-		t.Fatal(err)
-	}
 	var files []string
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasSuffix(name, ".txtar") || strings.HasSuffix(name, ".txt") {
-			files = append(files, filepath.Join(p.Dir, name))
+	if p.Dir == "" && p.Files != nil {
+		files = p.Files
+	} else {
+		entries, err := os.ReadDir(p.Dir)
+		if os.IsNotExist(err) {
+			// Continue so we give a helpful error on len(files)==0 below.
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasSuffix(name, ".txtar") || strings.HasSuffix(name, ".txt") {
+				files = append(files, filepath.Join(p.Dir, name))
+			}
+		}
+
+		if len(files) == 0 {
+			t.Fatal(fmt.Sprintf("no txtar nor txt scripts found in dir %s", p.Dir))
 		}
 	}
-
-	if len(files) == 0 {
-		t.Fatal(fmt.Sprintf("no txtar nor txt scripts found in dir %s", p.Dir))
-	}
 	testTempDir := p.WorkdirRoot
+	var err error
 	if testTempDir == "" {
-		testTempDir, err = ioutil.TempDir(os.Getenv("GOTMPDIR"), "go-test-script")
+		testTempDir, err = os.MkdirTemp(os.Getenv("GOTMPDIR"), "go-test-script")
 		if err != nil {
 			t.Fatal(err)
 		}
 	} else {
 		p.TestWork = true
 	}
-	// The temp dir returned by ioutil.TempDir might be a sym linked dir (default
+	// The temp dir returned by os.MkdirTemp might be a sym linked dir (default
 	// behaviour in macOS). That could mess up matching that includes $WORK if,
 	// for example, an external program outputs resolved paths. Evaluating the
 	// dir here will ensure consistency.
@@ -298,10 +309,26 @@ func RunT(t T, p Params) {
 	}
 
 	refCount := int32(len(files))
+	names := make(map[string]bool)
 	for _, file := range files {
-		file := file
-		name := strings.TrimSuffix(filepath.Base(file), ".txt")
-		name = strings.TrimSuffix(name, ".txtar")
+		name := filepath.Base(file)
+		if name1, ok := strings.CutSuffix(name, ".txt"); ok {
+			name = name1
+		} else if name1, ok := strings.CutSuffix(name, ".txtar"); ok {
+			name = name1
+		}
+		// We can have duplicate names when files are passed explicitly,
+		// so disambiguate by adding a counter.
+		// Take care to handle the situation where a name with a counter-like
+		// suffix already exists, for example:
+		//	a/foo.txt
+		//	b/foo.txtar
+		//	c/foo#1.txt
+		prefix := name
+		for i := 1; names[name]; i++ {
+			name = prefix + "#" + strconv.Itoa(i)
+		}
+		names[name] = true
 		t.Run(name, func(t T) {
 			t.Parallel()
 			ts := &TestScript{
@@ -354,6 +381,9 @@ type TestScript struct {
 	stdin         string                      // standard input to next 'go' command; set by 'stdin' command.
 	stdout        string                      // standard output from last 'go' command; for 'stdout' command
 	stderr        string                      // standard error from last 'go' command; for 'stderr' command
+	ttyin         string                      // terminal input; set by 'ttyin' command
+	stdinPty      bool                        // connect pty to standard input; set by 'ttyin -stdin' command
+	ttyout        string                      // terminal output; for 'ttyout' command
 	stopped       bool                        // test wants to stop early
 	start         time.Time                   // time phase started
 	background    []backgroundCmd             // backgrounded 'exec' and 'go' commands
@@ -361,6 +391,17 @@ type TestScript struct {
 	archive       *txtar.Archive              // the testscript being run.
 	scriptFiles   map[string]string           // files stored in the txtar archive (absolute paths -> path in script)
 	scriptUpdates map[string]string           // updates to testscript files via UpdateScripts.
+
+	// runningBuiltin indicates if we are running a user-supplied builtin
+	// command. These commands are specified via Params.Cmds.
+	runningBuiltin bool
+
+	// builtinStd(out|err) are established if a user-supplied builtin command
+	// requests Stdout() or Stderr(). Either both are non-nil, or both are nil.
+	// This invariant is maintained by both setBuiltinStd() and
+	// clearBuiltinStd().
+	builtinStdout *strings.Builder
+	builtinStderr *strings.Builder
 
 	ctxt        context.Context // per TestScript context
 	gracePeriod time.Duration   // time between SIGQUIT and SIGKILL
@@ -388,6 +429,9 @@ func writeFile(name string, data []byte, perm fs.FileMode, excl bool) error {
 	}
 	return nil
 }
+
+// Name returns the short name or basename of the test script.
+func (ts *TestScript) Name() string { return ts.name }
 
 // setup sets up the test execution temporary directory and environment.
 // It returns the comment section of the txtar archive.
@@ -420,15 +464,26 @@ func (ts *TestScript) setup() string {
 			"/=" + string(os.PathSeparator),
 			":=" + string(os.PathListSeparator),
 			"$=$",
-
-			// If we are collecting coverage profiles for merging into the main one,
-			// ensure the environment variable is forwarded to sub-processes.
-			"GOCOVERDIR=" + os.Getenv("GOCOVERDIR"),
 		},
 		WorkDir: ts.workdir,
 		Values:  make(map[interface{}]interface{}),
 		Cd:      ts.workdir,
 		ts:      ts,
+	}
+
+	// These env vars affect how a Go program behaves at run-time;
+	// If the user or `go test` wrapper set them, we should propagate them
+	// so that sub-process commands run via the test binary see them as well.
+	for _, name := range []string{
+		// If we are collecting coverage profiles, e.g. `go test -coverprofile`.
+		"GOCOVERDIR",
+		// If the user set GORACE when running a command like `go test -race`,
+		// such as GORACE=atexit_sleep_ms=10 to avoid the default 1s sleeps.
+		"GORACE",
+	} {
+		if val := os.Getenv(name); val != "" {
+			env.Vars = append(env.Vars, name+"="+val)
+		}
 	}
 	// Must preserve SYSTEMROOT on Windows: https://github.com/golang/go/issues/25513 et al
 	if runtime.GOOS == "windows" {
@@ -586,7 +641,6 @@ func (ts *TestScript) run() {
 	for _, bg := range ts.background {
 		interruptProcess(bg.cmd.Process)
 	}
-	ts.cmdWait(false, nil)
 
 	// If we reached here but we've failed (probably because ContinueOnError
 	// was set), don't wipe the log and print "PASS".
@@ -601,11 +655,6 @@ func (ts *TestScript) run() {
 		fmt.Fprintf(&ts.log, "PASS\n")
 	}
 }
-
-func (ts *TestScript) runLine(line string) (runOK bool) {
-	defer catchFailNow(func() {
-		runOK = false
-	})
 
 	// Parse input line. Ignore blanks entirely.
 	args := ts.parse(line)
@@ -649,18 +698,6 @@ func (ts *TestScript) runLine(line string) (runOK bool) {
 		if len(args) == 0 {
 			ts.Fatalf("! on line by itself")
 		}
-	}
-
-	// Run command.
-	cmd := scriptCmds[args[0]]
-	if cmd == nil {
-		cmd = ts.params.Cmds[args[0]]
-	}
-	if cmd == nil {
-		ts.Fatalf("unknown command %q", args[0])
-	}
-	cmd(ts, neg, args[1:])
-	return true
 }
 
 func (ts *TestScript) applyScriptUpdates() {
@@ -691,7 +728,7 @@ func (ts *TestScript) applyScriptUpdates() {
 			panic("script update file not found")
 		}
 	}
-	if err := ioutil.WriteFile(ts.file, txtar.Format(ts.archive), 0o666); err != nil {
+	if err := os.WriteFile(ts.file, txtar.Format(ts.archive), 0o666); err != nil {
 		ts.t.Fatal("cannot update script: ", err)
 	}
 	ts.Logf("%s updated", ts.file)
@@ -788,6 +825,60 @@ func (ts *TestScript) Check(err error) {
 	}
 }
 
+// Stdout returns an io.Writer that can be used by a user-supplied builtin
+// command (declared via Params.Cmds) to write to stdout. If this method is
+// called outside of the execution of a user-supplied builtin command, the
+// call panics.
+func (ts *TestScript) Stdout() io.Writer {
+	if !ts.runningBuiltin {
+		panic("can only call TestScript.Stdout when running a builtin command")
+	}
+	ts.setBuiltinStd()
+	return ts.builtinStdout
+}
+
+// Stderr returns an io.Writer that can be used by a user-supplied builtin
+// command (declared via Params.Cmds) to write to stderr. If this method is
+// called outside of the execution of a user-supplied builtin command, the
+// call panics.
+func (ts *TestScript) Stderr() io.Writer {
+	if !ts.runningBuiltin {
+		panic("can only call TestScript.Stderr when running a builtin command")
+	}
+	ts.setBuiltinStd()
+	return ts.builtinStderr
+}
+
+// setBuiltinStd ensures that builtinStdout and builtinStderr are non nil.
+func (ts *TestScript) setBuiltinStd() {
+	// This method must maintain the invariant that both builtinStdout and
+	// builtinStderr are set or neither are set
+
+	// If both are set, nothing to do
+	if ts.builtinStdout != nil && ts.builtinStderr != nil {
+		return
+	}
+	ts.builtinStdout = new(strings.Builder)
+	ts.builtinStderr = new(strings.Builder)
+}
+
+// clearBuiltinStd sets ts.stdout and ts.stderr from the builtin command
+// buffers, logs both, and resets both builtinStdout and builtinStderr to nil.
+func (ts *TestScript) clearBuiltinStd() {
+	// This method must maintain the invariant that both builtinStdout and
+	// builtinStderr are set or neither are set
+
+	// If neither set, nothing to do
+	if ts.builtinStdout == nil && ts.builtinStderr == nil {
+		return
+	}
+	ts.stdout = ts.builtinStdout.String()
+	ts.builtinStdout = nil
+	ts.stderr = ts.builtinStderr.String()
+	ts.builtinStderr = nil
+	ts.logStd()
+}
+
 // Logf appends the given formatted message to the test log transcript.
 func (ts *TestScript) Logf(format string, args ...interface{}) {
 	format = strings.TrimSuffix(format, "\n")
@@ -808,16 +899,49 @@ func (ts *TestScript) exec(command string, args ...string) (stdout, stderr strin
 	var stdoutBuf, stderrBuf strings.Builder
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
+	if ts.ttyin != "" {
+		ctrl, tty, err := pty.Open()
+		if err != nil {
+			return "", "", err
+		}
+		doneR, doneW := make(chan struct{}), make(chan struct{})
+		var ptyBuf strings.Builder
+		go func() {
+			io.Copy(ctrl, strings.NewReader(ts.ttyin))
+			ctrl.Write([]byte{4 /* EOT */})
+			close(doneW)
+		}()
+		go func() {
+			io.Copy(&ptyBuf, ctrl)
+			close(doneR)
+		}()
+		defer func() {
+			tty.Close()
+			ctrl.Close()
+			<-doneR
+			<-doneW
+			ts.ttyin = ""
+			ts.ttyout = ptyBuf.String()
+		}()
+		pty.SetCtty(cmd, tty)
+		if ts.stdinPty {
+			cmd.Stdin = tty
+		}
+	}
 	if err = cmd.Start(); err == nil {
 		err = waitOrStop(ts.ctxt, cmd, ts.gracePeriod)
 	}
 	ts.stdin = ""
+	ts.stdinPty = false
 	return stdoutBuf.String(), stderrBuf.String(), err
 }
 
 // execBackground starts the given command line (an actual subprocess, not simulated)
 // in ts.cd with environment ts.env.
 func (ts *TestScript) execBackground(command string, args ...string) (*exec.Cmd, error) {
+	if ts.ttyin != "" {
+		return nil, errors.New("ttyin is not supported by background commands")
+	}
 	cmd, err := ts.buildExecCmd(command, args...)
 	if err != nil {
 		return nil, err
@@ -852,6 +976,24 @@ func (ts *TestScript) BackgroundCmds() []*exec.Cmd {
 		cmds[i] = b.cmd
 	}
 	return cmds
+}
+
+// Chdir changes the current directory of the script.
+// The path may be relative to the current directory.
+func (ts *TestScript) Chdir(dir string) error {
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(ts.cd, dir)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+
+	ts.cd = dir
+	return nil
 }
 
 // waitOrStop waits for the already-started command cmd by calling its Wait method.
@@ -933,13 +1075,18 @@ func interruptProcess(p *os.Process) {
 func (ts *TestScript) Exec(command string, args ...string) error {
 	var err error
 	ts.stdout, ts.stderr, err = ts.exec(command, args...)
+	ts.logStd()
+	return err
+}
+
+// logStd logs the current non-empty values of stdout and stderr.
+func (ts *TestScript) logStd() {
 	if ts.stdout != "" {
 		ts.Logf("[stdout]\n%s", ts.stdout)
 	}
 	if ts.stderr != "" {
 		ts.Logf("[stderr]\n%s", ts.stderr)
 	}
-	return err
 }
 
 // expand applies environment variable expansion to the string s.
@@ -954,6 +1101,12 @@ func (ts *TestScript) expand(s string) string {
 
 // fatalf aborts the test with the given failure message.
 func (ts *TestScript) Fatalf(format string, args ...interface{}) {
+	// In user-supplied builtins, the only way we have of aborting
+	// is via Fatalf. Hence if we are aborting from a user-supplied
+	// builtin, it's important we first log stdout and stderr. If
+	// we are not, the following call is a no-op.
+	ts.clearBuiltinStd()
+
 	fmt.Fprintf(&ts.log, "FAIL: %s:%d: %s\n", ts.file, ts.lineno, fmt.Sprintf(format, args...))
 	// This should be caught by the defer inside the TestScript.runLine method.
 	// We do this rather than calling ts.t.FailNow directly because we want to
@@ -971,7 +1124,7 @@ func (ts *TestScript) MkAbs(file string) string {
 }
 
 // ReadFile returns the contents of the file with the
-// given name, intepreted relative to the test script's
+// given name, interpreted relative to the test script's
 // current directory. It interprets "stdout" and "stderr" to
 // mean the standard output or standard error from
 // the most recent exec or wait command respectively.
@@ -983,9 +1136,11 @@ func (ts *TestScript) ReadFile(file string) string {
 		return ts.stdout
 	case "stderr":
 		return ts.stderr
+	case "ttyout":
+		return ts.ttyout
 	default:
 		file = ts.MkAbs(file)
-		data, err := ioutil.ReadFile(file)
+		data, err := os.ReadFile(file)
 		ts.Check(err)
 		return string(data)
 	}
@@ -1066,11 +1221,11 @@ func (ts *TestScript) parse(line string) []string {
 func removeAll(dir string) error {
 	// module cache has 0o444 directories;
 	// make them writable in order to remove content.
-	filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+	filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // ignore errors walking in file system
 		}
-		if info.IsDir() {
+		if entry.IsDir() {
 			os.Chmod(path, 0o777)
 		}
 		return nil

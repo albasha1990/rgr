@@ -4,6 +4,7 @@
 // in that package.
 //
 // See that package for documentation on everything else.
+
 package module
 
 import "golang.org/x/mod/module"

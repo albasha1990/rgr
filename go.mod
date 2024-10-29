@@ -1,5 +1,9 @@
 module github.com/rogpeppe/go-internal
 
-go 1.19
+go 1.22.0
 
-require golang.org/x/mod v0.9.0
+require (
+	golang.org/x/mod v0.21.0
+	golang.org/x/sys v0.26.0
+	golang.org/x/tools v0.26.0
+)
