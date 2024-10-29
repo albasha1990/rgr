@@ -9,7 +9,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -49,12 +48,28 @@ func signalCatcher() int {
 	signal.Notify(c, os.Interrupt)
 	// Create a file so that the test can know that
 	// we will catch the signal.
-	if err := ioutil.WriteFile("catchsignal", nil, 0o666); err != nil {
+	if err := os.WriteFile("catchsignal", nil, 0o666); err != nil {
 		fmt.Println(err)
 		return 1
 	}
 	<-c
 	fmt.Println("caught interrupt")
+	return 0
+}
+
+func terminalPrompt() int {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		fmt.Println(err)
+		return 1
+	}
+	tty.WriteString("The magic words are: ")
+	var words string
+	fmt.Fscanln(tty, &words)
+	if words != "SQUEAMISHOSSIFRAGE" {
+		fmt.Println(words)
+		return 42
+	}
 	return 0
 }
 
@@ -65,24 +80,19 @@ func TestMain(m *testing.M) {
 
 	showVerboseEnv = false
 	os.Exit(RunMain(m, map[string]func() int{
-		"printargs":     printArgs,
-		"fprintargs":    fprintArgs,
-		"status":        exitWithStatus,
-		"signalcatcher": signalCatcher,
+		"printargs":      printArgs,
+		"fprintargs":     fprintArgs,
+		"status":         exitWithStatus,
+		"signalcatcher":  signalCatcher,
+		"terminalprompt": terminalPrompt,
 	}))
 }
 
 func TestCRLFInput(t *testing.T) {
-	td, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("failed to create TempDir: %v", err)
-	}
-	defer func() {
-		os.RemoveAll(td)
-	}()
+	td := t.TempDir()
 	tf := filepath.Join(td, "script.txt")
 	contents := []byte("exists output.txt\r\n-- output.txt --\r\noutput contents")
-	if err := ioutil.WriteFile(tf, contents, 0o644); err != nil {
+	if err := os.WriteFile(tf, contents, 0o644); err != nil {
 		t.Fatalf("failed to write to %v: %v", tf, err)
 	}
 	t.Run("_", func(t *testing.T) {
@@ -132,6 +142,31 @@ func TestEnv(t *testing.T) {
 		if panicValue == nil {
 			t.Errorf("e.Setenv(%q) did not panic, want panic", key)
 		}
+	}
+}
+
+func TestSetupFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "foo.txt"), nil, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	ft := &fakeT{}
+	func() {
+		defer catchAbort()
+		RunT(ft, Params{
+			Dir: dir,
+			Setup: func(*Env) error {
+				return fmt.Errorf("some failure")
+			},
+		})
+	}()
+	if !ft.failed {
+		t.Fatal("test should have failed because of setup failure")
+	}
+
+	want := regexp.MustCompile(`\nFAIL: .*: some failure\n$`)
+	if got := ft.log.String(); !want.MatchString(got) {
+		t.Fatalf("expected msg to match `%v`; got:\n%q", want, got)
 	}
 }
 
@@ -188,49 +223,71 @@ func TestScripts(t *testing.T) {
 				fset := flag.NewFlagSet("testscript", flag.ContinueOnError)
 				fUpdate := fset.Bool("update", false, "update scripts when cmp fails")
 				fExplicitExec := fset.Bool("explicit-exec", false, "require explicit use of exec for commands")
-				fVerbose := fset.Bool("v", false, "be verbose with output")
-				fContinue := fset.Bool("continue", false, "continue on error")
-				if err := fset.Parse(args); err != nil {
-					ts.Fatalf("failed to parse args for testscript: %v", err)
 				}
-				if fset.NArg() != 1 {
-					ts.Fatalf("testscript [-v] [-continue] [-update] [-explicit-exec] <dir>")
+				var files []string
+				var dir string
+				if *fFiles {
+					for _, f := range fset.Args() {
+						files = append(files, ts.MkAbs(f))
+					}
+				} else {
+					dir = ts.MkAbs(fset.Arg(0))
 				}
-				dir := fset.Arg(0)
-				t := &fakeT{ts: ts, verbose: *fVerbose}
+				t := &fakeT{verbose: *fVerbose}
 				func() {
-					defer func() {
-						if err := recover(); err != nil {
-							if err != errAbort {
-								panic(err)
-							}
-						}
-					}()
+					defer catchAbort()
 					RunT(t, Params{
-						Dir:                 ts.MkAbs(dir),
+						Dir:                 dir,
+						Files:               files,
 						UpdateScripts:       *fUpdate,
 						RequireExplicitExec: *fExplicitExec,
+						RequireUniqueNames:  *fUniqueNames,
 						Cmds: map[string]func(ts *TestScript, neg bool, args []string){
 							"some-param-cmd": func(ts *TestScript, neg bool, args []string) {
 							},
+							"echoandexit": echoandexit,
 						},
 						ContinueOnError: *fContinue,
 					})
 				}()
-				ts.stdout = strings.Replace(t.log.String(), ts.workdir, "$WORK", -1)
+				stdout := t.log.String()
+				stdout = strings.ReplaceAll(stdout, ts.workdir, "$WORK")
+				fmt.Fprint(ts.Stdout(), stdout)
 				if neg {
-					if len(t.failMsgs) == 0 {
+					if !t.failed {
 						ts.Fatalf("testscript unexpectedly succeeded")
 					}
 					return
 				}
-				if len(t.failMsgs) > 0 {
-					ts.Fatalf("testscript unexpectedly failed with errors: %q", t.failMsgs)
+				if t.failed {
+					ts.Fatalf("testscript unexpectedly failed with errors: %q", &t.log)
+				}
+			},
+			"echoandexit": echoandexit,
+			"mkChdir": func(ts *TestScript, neg bool, args []string) {
+				if neg {
+					ts.Fatalf("unsupported: ! mkChdir")
+				}
+				if len(args) != 1 {
+					ts.Fatalf("usage: mkChdir dir")
+				}
+
+				dir := args[0]
+				if !filepath.IsAbs(dir) {
+					dir = ts.MkAbs(dir)
+				}
+
+				if err := os.MkdirAll(dir, 0o777); err != nil {
+					ts.Fatalf("cannot create dir: %v", err)
+				}
+
+				if err := ts.Chdir(dir); err != nil {
+					ts.Fatalf("cannot chdir: %v", err)
 				}
 			},
 		},
 		Setup: func(env *Env) error {
-			infos, err := ioutil.ReadDir(env.WorkDir)
+			infos, err := os.ReadDir(env.WorkDir)
 			if err != nil {
 				return fmt.Errorf("cannot read workdir: %v", err)
 			}
@@ -251,6 +308,33 @@ func TestScripts(t *testing.T) {
 		t.Fatalf("defer mismatch; got %d want 0", testDeferCount)
 	}
 	// TODO check that the temp directory has been removed.
+}
+
+func echoandexit(ts *TestScript, neg bool, args []string) {
+	// Takes at least one argument
+	//
+	// args[0] - int that indicates the exit code of the command
+	// args[1] - the string to echo to stdout if non-empty
+	// args[2] - the string to echo to stderr if non-empty
+	if len(args) == 0 || len(args) > 3 {
+		ts.Fatalf("echoandexit takes at least one and at most three arguments")
+	}
+	if neg {
+		ts.Fatalf("neg means nothing for echoandexit")
+	}
+	exitCode, err := strconv.ParseInt(args[0], 10, 64)
+	if err != nil {
+		ts.Fatalf("failed to parse exit code from %q: %v", args[0], err)
+	}
+	if len(args) > 1 && args[1] != "" {
+		fmt.Fprint(ts.Stdout(), args[1])
+	}
+	if len(args) > 2 && args[2] != "" {
+		fmt.Fprint(ts.Stderr(), args[2])
+	}
+	if exitCode != 0 {
+		ts.Fatalf("told to exit with code %d", exitCode)
+	}
 }
 
 // TestTestwork tests that using the flag -testwork will make sure the work dir isn't removed
@@ -281,11 +365,7 @@ func TestTestwork(t *testing.T) {
 
 // TestWorkdirRoot tests that a non zero value in Params.WorkdirRoot is honoured
 func TestWorkdirRoot(t *testing.T) {
-	td, err := ioutil.TempDir("", "")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(td)
+	td := t.TempDir()
 	params := Params{
 		Dir:         filepath.Join("testdata", "nothing"),
 		WorkdirRoot: td,
@@ -310,24 +390,21 @@ func TestWorkdirRoot(t *testing.T) {
 func TestBadDir(t *testing.T) {
 	ft := new(fakeT)
 	func() {
-		defer func() {
-			if err := recover(); err != nil {
-				if err != errAbort {
-					panic(err)
-				}
-			}
-		}()
+		defer catchAbort()
 		RunT(ft, Params{
 			Dir: "thiswillnevermatch",
 		})
 	}()
-	wantCount := 1
-	if got := len(ft.failMsgs); got != wantCount {
-		t.Fatalf("expected %v fail message; got %v", wantCount, got)
+	want := regexp.MustCompile(`no txtar nor txt scripts found in dir thiswillnevermatch`)
+	if got := ft.log.String(); !want.MatchString(got) {
+		t.Fatalf("expected msg to match `%v`; got:\n%v", want, got)
 	}
-	wantMsg := regexp.MustCompile(`no txtar nor txt scripts found in dir thiswillnevermatch`)
-	if got := ft.failMsgs[0]; !wantMsg.MatchString(got) {
-		t.Fatalf("expected msg to match `%v`; got:\n%v", wantMsg, got)
+}
+
+// catchAbort catches the panic raised by fakeT.FailNow.
+func catchAbort() {
+	if err := recover(); err != nil && err != errAbort {
+		panic(err)
 	}
 }
 
@@ -398,11 +475,9 @@ func waitFile(ts *TestScript, neg bool, args []string) {
 }
 
 type fakeT struct {
-	ts       *TestScript
-	log      bytes.Buffer
-	failMsgs []string
-	verbose  bool
-	failed   bool
+	log     strings.Builder
+	verbose bool
+	failed  bool
 }
 
 var errAbort = errors.New("abort test")
@@ -412,9 +487,8 @@ func (t *fakeT) Skip(args ...interface{}) {
 }
 
 func (t *fakeT) Fatal(args ...interface{}) {
-	t.failed = true
-	t.failMsgs = append(t.failMsgs, fmt.Sprint(args...))
-	panic(errAbort)
+	t.Log(args...)
+	t.FailNow()
 }
 
 func (t *fakeT) Parallel() {}
@@ -424,17 +498,32 @@ func (t *fakeT) Log(args ...interface{}) {
 }
 
 func (t *fakeT) FailNow() {
-	t.Fatal("failed")
+	t.failed = true
+	panic(errAbort)
 }
 
 func (t *fakeT) Run(name string, f func(T)) {
-	f(t)
+	fmt.Fprintf(&t.log, "** RUN %s **\n", name)
+	defer catchAbort()
+	f(&subT{
+		fakeT: t,
+	})
 }
 
 func (t *fakeT) Verbose() bool {
 	return t.verbose
 }
 
-func (t *fakeT) Failed() bool {
-	return t.failed
+type subT struct {
+	*fakeT
+	failed bool
+}
+
+func (t *subT) Run(name string, f func(T)) {
+	panic("multiple test levels not supported")
+}
+
+func (t *subT) FailNow() {
+	t.failed = true
+	t.fakeT.FailNow()
 }

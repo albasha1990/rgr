@@ -8,15 +8,14 @@
 //
 //	txtar-x [-C root-dir] saved.txt
 //
-// See https://godoc.org/github.com/rogpeppe/go-internal/txtar for details of the format
+// See https://godoc.org/golang.org/x/tools/txtar for details of the format
 // and how to parse a txtar file.
-//
 package main
 
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"os"
 
@@ -48,7 +47,7 @@ func main1() int {
 
 	var a *txtar.Archive
 	if flag.NArg() == 0 {
-		data, err := ioutil.ReadAll(os.Stdin)
+		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			log.Printf("cannot read stdin: %v", err)
 			return 1
